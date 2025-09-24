@@ -215,5 +215,5 @@ checkpoints/
 # Model versioning
 mlruns/
 mlartifacts/
-*.pot
+*.pt
 *.onnx
