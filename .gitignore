@@ -211,3 +211,9 @@ __marimo__/
 tb_logs/
 checkpoints/
 .idea/
+
+# Model versioning
+mlruns/
+mlartifacts/
+*.pot
+*.onnx
