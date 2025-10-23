@@ -214,7 +214,7 @@ def load_test_images(dataset_dir: str, img_ids: list):
 
 if __name__ == "__main__":
     # Configuration
-    checkpoint_path = "checkpoints/yolo_fetal_structures_20250923_223741/weights/best.pt"
+    checkpoint_path = "best_finetuned.pt"
     dataset_dir = os.getenv("DATASET_DIR", "data")
 
     print("🚀 YOLO ONNX Export and Validation")
