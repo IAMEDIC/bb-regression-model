@@ -3,6 +3,9 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Any, List, Tuple
+from dataclasses import dataclass, asdict
+import itertools
 
 import albumentations as A
 import cv2
@@ -34,17 +37,225 @@ IMG_METADATA_PATH = os.path.join(FINETUNE_DS_DIR, "media.csv")
 DATASET_VERSION = "2025-30-09"
 BEST_MODEL_PATH = os.getenv("BEST_MODEL_PATH")
 MLFLOW_URI = os.getenv("MLFLOW_URI")
-MLFLOW_EXPERIMENT_NAME = f"Fetal_Structures_yolo_{TARGET_HEIGHT}x{TARGET_WIDTH}_finetuned_solimed"
+MLFLOW_EXPERIMENT_NAME = f"Fetal_Structures_yolo_{TARGET_HEIGHT}x{TARGET_WIDTH}_finetuned_solimed_hyperparam_search"
 MLFLOW_USER = os.getenv("MLFLOW_USER")
 MODEL_NAME = f"fetal_structures_yolo_{TARGET_HEIGHT}x{TARGET_WIDTH}_finetuned_solimed_{DATASET_VERSION}"
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-K_FOLDS = 1
-BATCH_SIZE = 32
 NUM_EPOCHS = 2000
-LEARNING_RATE = 1e-2
-WEIGHT_DECAY = 5e-4
-EARLY_STOPPING_PATIENCE = 200
-VAL_SPLIT_RATIO = 0.3
+
+# Hyperparameter Search Space Configuration
+HYPERPARAM_SEARCH_SPACE = {
+    'learning_rate': [1e-3, 5e-3, 1e-2],
+    'weight_decay': [1e-4, 5e-4, 1e-3],
+    'batch_size': [8, 16, 32],
+    'early_stopping_patience': list(range(100, 501, 100)),
+    'n_val_videos': list(range(5, 16)),
+    # Augmentation configurations (each is a preset)
+    'augmentation_preset': ['lowest', 'light', 'medium', 'heavy']
+}
+
+# Define augmentation presets
+AUGMENTATION_PRESETS = {
+    'lowest': {
+        'horizontal_flip_p': 0,
+        'blur_p': 0.0,
+        'noise_p': 0.1,
+        'brightness_contrast_p': 0.1,
+        'gamma_p': 0.1,
+        'motion_blur_limit': 1,
+        'gaussian_blur_limit': 1,
+        'noise_std_range': (0.01, 0.02),
+        'brightness_limit': 0.0,
+        'contrast_limit': 0.0,
+        'gamma_limit': (99, 100),
+    },
+    'light': {
+        'horizontal_flip_p': 0.3,
+        'blur_p': 0.1,
+        'noise_p': 0.2,
+        'brightness_contrast_p': 0.3,
+        'gamma_p': 0.2,
+        'motion_blur_limit': 3,
+        'gaussian_blur_limit': 3,
+        'noise_std_range': (0.03, 0.05),
+        'brightness_limit': 0.1,
+        'contrast_limit': 0.1,
+        'gamma_limit': (95, 105),
+    },
+    'medium': {
+        'horizontal_flip_p': 0.5,
+        'blur_p': 0.3,
+        'noise_p': 0.4,
+        'brightness_contrast_p': 0.5,
+        'gamma_p': 0.3,
+        'motion_blur_limit': 5,
+        'gaussian_blur_limit': 5,
+        'noise_std_range': (0.05, 0.07),
+        'brightness_limit': 0.15,
+        'contrast_limit': 0.15,
+        'gamma_limit': (90, 110),
+    },
+    'heavy': {
+        'horizontal_flip_p': 0.7,
+        'blur_p': 0.5,
+        'noise_p': 0.5,
+        'brightness_contrast_p': 0.6,
+        'gamma_p': 0.4,
+        'motion_blur_limit': 7,
+        'gaussian_blur_limit': 7,
+        'noise_std_range': (0.07, 0.10),
+        'brightness_limit': 0.2,
+        'contrast_limit': 0.2,
+        'gamma_limit': (85, 115),
+    }
+}
+
+
+@dataclass
+class HyperparamConfig:
+    """Dataclass to store hyperparameter configuration"""
+    learning_rate: float
+    weight_decay: float
+    batch_size: int
+    early_stopping_patience: int
+    n_val_videos: int
+    augmentation_preset: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def get_aug_params(self) -> Dict[str, Any]:
+        return AUGMENTATION_PRESETS[self.augmentation_preset]
+
+
+@dataclass
+class ExperimentResult:
+    """Store results from an experiment"""
+    config: HyperparamConfig
+    val_box_iou: float
+    val_map50: float
+    mlflow_run_id: str
+    best_model_path: str
+    timestamp: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'config': self.config.to_dict(),
+            'val_box_iou': self.val_box_iou,
+            'val_map50': self.val_map50,
+            'mlflow_run_id': self.mlflow_run_id,
+            'best_model_path': self.best_model_path,
+            'timestamp': self.timestamp
+        }
+
+
+class HyperparamSearchTracker:
+    """Track all experiments and best results"""
+    def __init__(self, save_dir: Path):
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.results: List[ExperimentResult] = []
+        self.best_iou_result: ExperimentResult = None
+        self.best_map50_result: ExperimentResult = None
+
+    def add_result(self, result: ExperimentResult):
+        self.results.append(result)
+
+        # Update best IOU
+        if self.best_iou_result is None or result.val_box_iou > self.best_iou_result.val_box_iou:
+            self.best_iou_result = result
+
+        # Update best mAP@50
+        if self.best_map50_result is None or result.val_map50 > self.best_map50_result.val_map50:
+            self.best_map50_result = result
+
+        self._save_results()
+
+    def _save_results(self):
+        """Save all results to JSON"""
+        data = {
+            'all_results': [r.to_dict() for r in self.results],
+            'best_iou': self.best_iou_result.to_dict() if self.best_iou_result else None,
+            'best_map50': self.best_map50_result.to_dict() if self.best_map50_result else None,
+        }
+
+        with open(self.save_dir / 'hyperparam_search_results.json', 'w') as f:
+            json.dump(data, f, indent=2)
+
+        # Also save a summary CSV
+        df = pd.DataFrame([
+            {
+                **r.config.to_dict(),
+                'val_box_iou': r.val_box_iou,
+                'val_map50': r.val_map50,
+                'mlflow_run_id': r.mlflow_run_id,
+                'timestamp': r.timestamp
+            }
+            for r in self.results
+        ])
+        df.to_csv(self.save_dir / 'hyperparam_search_summary.csv', index=False)
+
+    def print_summary(self):
+        """Print summary of best results"""
+        print("\n" + "="*80)
+        print("HYPERPARAMETER SEARCH SUMMARY")
+        print("="*80)
+        print(f"\nTotal experiments run: {len(self.results)}")
+
+        if self.best_iou_result:
+            print("\n" + "-"*80)
+            print("BEST VAL BOX IOU:")
+            print(f"  IOU: {self.best_iou_result.val_box_iou:.4f}")
+            print(f"  mAP@50: {self.best_iou_result.val_map50:.4f}")
+            print(f"  Config: {json.dumps(self.best_iou_result.config.to_dict(), indent=4)}")
+            print(f"  MLflow Run ID: {self.best_iou_result.mlflow_run_id}")
+            print(f"  Model Path: {self.best_iou_result.best_model_path}")
+
+        if self.best_map50_result:
+            print("\n" + "-"*80)
+            print("BEST VAL mAP@50:")
+            print(f"  mAP@50: {self.best_map50_result.val_map50:.4f}")
+            print(f"  IOU: {self.best_map50_result.val_box_iou:.4f}")
+            print(f"  Config: {json.dumps(self.best_map50_result.config.to_dict(), indent=4)}")
+            print(f"  MLflow Run ID: {self.best_map50_result.mlflow_run_id}")
+            print(f"  Model Path: {self.best_map50_result.best_model_path}")
+        print("="*80 + "\n")
+
+
+def generate_hyperparam_configs(search_space: Dict[str, List],
+                                 max_configs: int = None,
+                                 random_sample: bool = False) -> List[HyperparamConfig]:
+    """Generate hyperparameter configurations from search space"""
+
+    if random_sample and max_configs:
+        # Random sampling
+        configs = []
+        keys = list(search_space.keys())
+        for _ in range(max_configs):
+            config_dict = {}
+            for k in keys:
+                val = np.random.choice(search_space[k])
+                # Convert numpy types to native Python types
+                if isinstance(val, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+                    val = int(val)
+                elif isinstance(val, (np.floating, np.float64, np.float32, np.float16)):
+                    val = float(val)
+                config_dict[k] = val
+            configs.append(HyperparamConfig(**config_dict))
+    else:
+        # Grid search
+        keys = list(search_space.keys())
+        values = [search_space[k] for k in keys]
+        all_combinations = list(itertools.product(*values))
+
+        if max_configs and len(all_combinations) > max_configs:
+            # Randomly sample if too many combinations
+            indices = np.random.choice(len(all_combinations), max_configs, replace=False)
+            all_combinations = [all_combinations[i] for i in indices]
+
+        configs = [HyperparamConfig(**dict(zip(keys, combo))) for combo in all_combinations]
+
+    return configs
 
 
 def load_and_preprocess_data():
@@ -73,11 +284,17 @@ def load_and_preprocess_data():
     return annotations_df
 
 
-def create_train_val_split(annotations_df):
-    """Create train/val split."""
+def create_train_val_split(annotations_df, n_val_videos=None):
+    """Create train/val split with optional limit on validation videos."""
     unique_img_paths = annotations_df['file_path'].unique()
     np.random.shuffle(unique_img_paths)
-    n_val = int(len(unique_img_paths) * VAL_SPLIT_RATIO)
+
+    # Calculate validation split
+    if n_val_videos is not None:
+        n_val = min(n_val_videos, len(unique_img_paths))
+    else:
+        n_val = int(len(unique_img_paths) * 0.3)
+
     val_img_names = unique_img_paths[:n_val].tolist()
     train_img_names = unique_img_paths[n_val:].tolist()
     val_annotations_df = annotations_df[annotations_df['file_path'].isin(val_img_names)]
@@ -107,7 +324,7 @@ def create_train_val_split(annotations_df):
     return train_img_names, val_img_names, ANNOTATIONS
 
 
-def get_transforms(aug_params: dict = None):
+def get_transforms(aug_params: Dict[str, Any] = None):
     """Define data augmentation transforms with configurable parameters."""
     if aug_params is None:
         # Default medium augmentation
@@ -332,32 +549,6 @@ def box_iou(box1: torch.Tensor, box2: torch.Tensor) -> float:
     return inter_area / union if union > 0 else 0.0
 
 
-def visualize_sample(sample, title="Sample"):
-    image = sample['image']
-    bboxes = sample['bboxes']
-    labels = sample['labels']
-
-    fig, ax = plt.subplots(1, 1, figsize=(5, 5))
-    ax.imshow(image)
-    ax.set_title(title)
-
-    colors = ['red', 'blue']
-    label_names = {0: 'NB', 1: 'NT'}
-
-    for bbox, label in zip(bboxes, labels):
-        label = int(label)
-        x_min, y_min, x_max, y_max = bbox
-        width = x_max - x_min
-        height = y_max - y_min
-        rect = patches.Rectangle((x_min, y_min), width, height, linewidth=2, edgecolor=colors[label % len(colors)], facecolor='none')
-        ax.add_patch(rect)
-        ax.text(x_min, y_min - 5, label_names[label], color=colors[label % len(colors)], fontsize=12, weight='bold', bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=2))
-
-    ax.axis('off')
-    plt.tight_layout()
-    plt.show()
-
-
 def mlflow_callback(trainer):
     epoch = trainer.epoch
     for k, v in trainer.metrics.items():
@@ -373,23 +564,72 @@ def setup_mlflow():
     print(f"MLflow Experiment: {MLFLOW_EXPERIMENT_NAME}")
 
 
-def train_and_log(train_img_names, val_img_names, yolo_config_path, timestamp):
+def run_single_experiment(config: HyperparamConfig,
+                          annotations_df: pd.DataFrame,
+                          experiment_idx: int,
+                          total_experiments: int) -> Tuple[ExperimentResult, str]:
+    """Run a single training experiment with given hyperparameter configuration"""
+
+    print(f"\n{'='*80}")
+    print(f"EXPERIMENT {experiment_idx + 1}/{total_experiments}")
+    print(f"{'='*80}")
+    print(f"Configuration:")
+    print(json.dumps(config.to_dict(), indent=2))
+    print(f"{'='*80}\n")
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    # Create train/val split with specified n_val_videos
+    train_img_names, val_img_names, ANNOTATIONS = create_train_val_split(
+        annotations_df,
+        n_val_videos=config.n_val_videos
+    )
+
+    # Get transforms with augmentation parameters
+    aug_params = config.get_aug_params()
+    train_transform, val_transform = get_transforms(aug_params)
+
+    # Create datasets
+    train_dataset = FinetuneDetectionDataset(
+        image_root=DATASET_IMAGES_DIR,
+        img_names=train_img_names,
+        annotations=ANNOTATIONS,
+        transform=train_transform
+    )
+    val_dataset = FinetuneDetectionDataset(
+        image_root=DATASET_IMAGES_DIR,
+        img_names=val_img_names,
+        annotations=ANNOTATIONS,
+        transform=val_transform
+    )
+
+    # Prepare YOLO dataset
+    FINETUNE_RUN_DIR = Path('runs') / 'hyperparam_search' / f'exp_{experiment_idx+1}_{timestamp}'
+    YOLO_DATASET_DIR = FINETUNE_RUN_DIR / 'dataset'
+    YOLO_DATASET_DIR.mkdir(parents=True, exist_ok=True)
+
+    train_prep = YOLODatasetPreparator(train_dataset, YOLO_DATASET_DIR)
+    val_prep = YOLODatasetPreparator(val_dataset, YOLO_DATASET_DIR)
+    train_prep.prepare_split('train')
+    val_prep.prepare_split('val')
+
+    yolo_config_path = create_yolo_config(YOLO_DATASET_DIR, train_dataset)
+
+    # Train model
     model_ckpt = BEST_MODEL_PATH if BEST_MODEL_PATH and os.path.exists(BEST_MODEL_PATH) else 'yolov8n.pt'
     print(f'Loading model checkpoint: {model_ckpt}')
     model = YOLO(model_ckpt)
-    for param in model.parameters():
-        param.requires_grad = True
 
     train_args = {
         'data': str(yolo_config_path),
         'epochs': NUM_EPOCHS,
         'imgsz': max(TARGET_HEIGHT, TARGET_WIDTH),
-        'batch': BATCH_SIZE,
-        'lr0': LEARNING_RATE,
-        'weight_decay': WEIGHT_DECAY,
-        'patience': EARLY_STOPPING_PATIENCE,
-        'project': str(Path('runs') / 'finetune'),
-        'name': f'yolo_finetuned_{timestamp}',
+        'batch': config.batch_size,
+        'lr0': config.learning_rate,
+        'weight_decay': config.weight_decay,
+        'patience': config.early_stopping_patience,
+        'project': str(FINETUNE_RUN_DIR.parent),
+        'name': FINETUNE_RUN_DIR.name,
         'exist_ok': True,
         'optimizer': 'AdamW',
         'verbose': True,
@@ -397,35 +637,68 @@ def train_and_log(train_img_names, val_img_names, yolo_config_path, timestamp):
         'workers': 0,
     }
 
-    with mlflow.start_run(run_name=f"{MLFLOW_USER}_yolo_finetune_{timestamp}") as run:
+    # Helper function to convert numpy types to native Python types
+    def convert_to_native_types(obj):
+        """Convert numpy/pandas types to native Python types for JSON serialization"""
+        if isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: convert_to_native_types(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [convert_to_native_types(item) for item in obj]
+        return obj
+
+    # Log to MLflow
+    with mlflow.start_run(run_name=f"{MLFLOW_USER}_exp_{experiment_idx+1}_{timestamp}") as run:
         mlflow_run_id = run.info.run_id
-        mlflow.log_params({
+
+        # Convert augmentation parameters to native types
+        aug_params_native = convert_to_native_types(aug_params)
+
+        # Log hyperparameters
+        params_to_log = {
             'model_type': 'YOLOv8',
             'finetune_from': model_ckpt,
             'num_classes': 2,
-            'class_names': ['NB', 'NT'],
+            'class_names': str(['NB', 'NT']),
             'train_images': len(train_img_names),
             'val_images': len(val_img_names),
-            **train_args
-        })
+            **config.to_dict(),
+            **{f'aug_{k}': str(v) if isinstance(v, (tuple, list)) else v for k, v in aug_params_native.items()},
+        }
+        # Add train_args separately
+        for k, v in train_args.items():
+            params_to_log[f'train_{k}'] = str(v) if isinstance(v, (Path, tuple, list)) else v
+
+        # Convert all params to native types
+        params_to_log = convert_to_native_types(params_to_log)
+
+        mlflow.log_params(params_to_log)
         mlflow.log_input(ImageListDataset(train_img_names), context='train')
         mlflow.log_input(ImageListDataset(val_img_names), context='val')
 
-        input("Press Enter to start training...")
+        # Train
         model.add_callback("on_fit_epoch_end", mlflow_callback)
         results = model.train(**train_args)
+
+        # Log training results
         if hasattr(results, 'results_dict'):
             for k, v in results.results_dict.items():
                 if isinstance(v, (int, float)):
                     safe_k = str(k).replace('(', '_').replace(')', '').replace('[', '_').replace(']', '').replace(' ', '_')
                     mlflow.log_metric(f"train/{safe_k}", float(v))
 
-        train_dir = Path(train_args['project']) / train_args['name']
-        best_pt = train_dir / 'weights' / 'best.pt'
+        # Log best model
+        best_pt = FINETUNE_RUN_DIR / 'weights' / 'best.pt'
         if best_pt.exists():
             mlflow.log_artifact(str(best_pt))
 
-        results_csv = train_dir / 'results.csv'
+        # Log per-epoch metrics
+        results_csv = FINETUNE_RUN_DIR / 'results.csv'
         if results_csv.exists():
             try:
                 df_results = pd.read_csv(results_csv)
@@ -446,16 +719,22 @@ def train_and_log(train_img_names, val_img_names, yolo_config_path, timestamp):
             except Exception as e:
                 print(f"Warning: failed to log per-epoch metrics: {e}")
 
+        # Validation
         val_results = model.val(data=str(yolo_config_path), split='val', verbose=True, plots=True)
+
+        # Extract validation metrics
+        val_map50 = 0.0
         if hasattr(val_results, 'results_dict'):
             for k, v in val_results.results_dict.items():
                 if isinstance(v, (int, float)):
                     safe_k = str(k).replace('(', '_').replace(')', '').replace('[', '_').replace(']', '').replace(' ', '_')
                     mlflow.log_metric(f"val/{safe_k}", float(v))
+                    if 'map50' in str(k).lower() or 'mAP50' in str(k):
+                        val_map50 = float(v)
 
-        # Custom evaluation
+        # Custom IOU evaluation
         all_ious = []
-        val_images_dir = Path('runs') / 'finetune' / f'yolo_finetuned_{timestamp}' / 'dataset' / 'val' / 'images'
+        val_images_dir = YOLO_DATASET_DIR / 'val' / 'images'
         for img_file in list(val_images_dir.glob('*.jpg'))[:500]:
             label_file = val_images_dir.parent / 'labels' / (img_file.stem + '.txt')
             gt_by_class = {}
@@ -471,6 +750,7 @@ def train_and_log(train_img_names, val_img_names, yolo_config_path, timestamp):
                                 cid = int(float(cid_token))
                             cx, cy, w, h = map(float, parts[1:])
                             gt_by_class[cid] = torch.tensor([cx, cy, w, h], dtype=torch.float32)
+
             preds = model.predict(str(img_file), conf=0.25, verbose=False)
             pred_by_class = {}
             if len(preds) > 0 and preds[0].boxes is not None:
@@ -483,7 +763,10 @@ def train_and_log(train_img_names, val_img_names, yolo_config_path, timestamp):
                     xyxy = boxes.xyxy.cpu().numpy()
                     xywhn = []
                     for x1, y1, x2, y2 in xyxy:
-                        cx = ((x1 + x2) / 2) / w; cy = ((y1 + y2) / 2) / h; ww = (x2 - x1) / w; hh = (y2 - y1) / h
+                        cx = ((x1 + x2) / 2) / w
+                        cy = ((y1 + y2) / 2) / h
+                        ww = (x2 - x1) / w
+                        hh = (y2 - y1) / h
                         xywhn.append([cx, cy, ww, hh])
                     xywhn = np.array(xywhn)
                 cls = boxes.cls.cpu().numpy().astype(int)
@@ -491,9 +774,11 @@ def train_and_log(train_img_names, val_img_names, yolo_config_path, timestamp):
                 for i, c in enumerate(cls):
                     if c not in pred_by_class or conf[i] > pred_by_class[c][1]:
                         pred_by_class[c] = (torch.tensor(xywhn[i], dtype=torch.float32), float(conf[i]))
+
             classes = set(list(gt_by_class.keys()) + list(pred_by_class.keys()))
             if not classes:
                 continue
+
             gt_mask = torch.zeros(2)
             pred_mask = torch.zeros(2)
             gt_boxes = torch.zeros((2, 4))
@@ -505,6 +790,7 @@ def train_and_log(train_img_names, val_img_names, yolo_config_path, timestamp):
                 if c in pred_by_class:
                     pred_mask[c] = 1
                     pred_boxes[c] = pred_by_class[c][0]
+
             ious = []
             for c in classes:
                 if gt_mask[c] == 1 and pred_mask[c] == 1:
@@ -512,51 +798,81 @@ def train_and_log(train_img_names, val_img_names, yolo_config_path, timestamp):
             if ious:
                 all_ious.append(float(np.mean(ious)))
 
-        if all_ious:
-            mlflow.log_metric('val_box_iou_mean', float(np.mean(all_ious)))
+        val_box_iou = float(np.mean(all_ious)) if all_ious else 0.0
+        mlflow.log_metric('val_box_iou_mean', val_box_iou)
 
-    print('Finetuning complete.')
+        print(f"\n{'='*80}")
+        print(f"EXPERIMENT {experiment_idx + 1} RESULTS:")
+        print(f"  Val Box IOU: {val_box_iou:.4f}")
+        print(f"  Val mAP@50: {val_map50:.4f}")
+        print(f"{'='*80}\n")
+
+        # Create result object
+        result = ExperimentResult(
+            config=config,
+            val_box_iou=val_box_iou,
+            val_map50=val_map50,
+            mlflow_run_id=mlflow_run_id,
+            best_model_path=str(best_pt) if best_pt.exists() else "",
+            timestamp=timestamp
+        )
+
+        return result, mlflow_run_id
 
 
 def main():
-    annotations_df = load_and_preprocess_data()
-    train_img_names, val_img_names, ANNOTATIONS = create_train_val_split(annotations_df)
+    """Main function to run hyperparameter search"""
 
-    train_transform, val_transform = get_transforms()
-
-    train_dataset = FinetuneDetectionDataset(
-        image_root=DATASET_IMAGES_DIR,
-        img_names=train_img_names,
-        annotations=ANNOTATIONS,
-        transform=train_transform
-    )
-    val_dataset = FinetuneDetectionDataset(
-        image_root=DATASET_IMAGES_DIR,
-        img_names=val_img_names,
-        annotations=ANNOTATIONS,
-        transform=val_transform
-    )
-
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    FINETUNE_RUN_DIR = Path('runs') / 'finetune' / f'yolo_finetuned_{timestamp}'
-    YOLO_DATASET_DIR = FINETUNE_RUN_DIR / 'dataset'
-    YOLO_DATASET_DIR.mkdir(parents=True, exist_ok=True)
-
-    train_prep = YOLODatasetPreparator(train_dataset, YOLO_DATASET_DIR)
-    val_prep = YOLODatasetPreparator(val_dataset, YOLO_DATASET_DIR)
-    train_prep.prepare_split('train')
-    val_prep.prepare_split('val')
-
-    yolo_config_path = create_yolo_config(YOLO_DATASET_DIR, train_dataset)
-    print(f'YOLO dataset at: {YOLO_DATASET_DIR}')
-
-    # Visualize a sample
-    for i in range(min(5, len(train_dataset))):
-        sample = train_dataset[i]
-        visualize_sample(sample, f"Augmented Training Sample {i+1}")
-
+    # Setup
     setup_mlflow()
-    train_and_log(train_img_names, val_img_names, yolo_config_path, timestamp)
+    annotations_df = load_and_preprocess_data()
+
+    # Generate hyperparameter configurations
+    # You can adjust max_configs to limit the number of experiments
+    # Set random_sample=True for random search instead of grid search
+    configs = generate_hyperparam_configs(
+        HYPERPARAM_SEARCH_SPACE,
+        max_configs=100,
+        random_sample=True  # Use random sampling
+    )
+
+    print(f"\n{'='*80}")
+    print(f"HYPERPARAMETER SEARCH")
+    print(f"{'='*80}")
+    print(f"Total configurations to test: {len(configs)}")
+    print(f"{'='*80}\n")
+
+    # Initialize tracker
+    tracker_dir = Path('runs') / 'hyperparam_search' / datetime.now().strftime('%Y%m%d_%H%M%S')
+    tracker = HyperparamSearchTracker(tracker_dir)
+
+    # Run experiments
+    for idx, config in enumerate(configs):
+        try:
+            result, run_id = run_single_experiment(config, annotations_df, idx, len(configs))
+            tracker.add_result(result)
+
+            # Print intermediate best results
+            print(f"\n{'='*80}")
+            print(f"PROGRESS: {idx + 1}/{len(configs)} experiments completed")
+            if tracker.best_iou_result:
+                print(f"Current Best IOU: {tracker.best_iou_result.val_box_iou:.4f}")
+            if tracker.best_map50_result:
+                print(f"Current Best mAP@50: {tracker.best_map50_result.val_map50:.4f}")
+            print(f"{'='*80}\n")
+
+        except Exception as e:
+            print(f"\n{'!'*80}")
+            print(f"ERROR in experiment {idx + 1}: {str(e)}")
+            print(f"{'!'*80}\n")
+            continue
+
+    # Print final summary
+    tracker.print_summary()
+
+    print(f"\nResults saved to: {tracker.save_dir}")
+    print(f"  - {tracker.save_dir / 'hyperparam_search_results.json'}")
+    print(f"  - {tracker.save_dir / 'hyperparam_search_summary.csv'}")
 
 
 if __name__ == "__main__":
