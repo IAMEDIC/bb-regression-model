@@ -44,7 +44,7 @@ NUM_EPOCHS = 2000
 LEARNING_RATE = 1e-2
 WEIGHT_DECAY = 5e-4
 EARLY_STOPPING_PATIENCE = 200
-N_VAL_VIDEOS = 8
+VAL_SPLIT_RATIO = 0.3
 
 
 def load_and_preprocess_data():
@@ -75,10 +75,13 @@ def load_and_preprocess_data():
 
 def create_train_val_split(annotations_df):
     """Create train/val split."""
-    unique_media_ids = annotations_df['media_id'].unique()
-    val_media_ids = np.random.choice(unique_media_ids, size=N_VAL_VIDEOS, replace=False)
-    val_annotations_df = annotations_df[annotations_df['media_id'].isin(val_media_ids)]
-    train_annotations_df = annotations_df[~annotations_df['media_id'].isin(val_media_ids)]
+    unique_img_paths = annotations_df['file_path'].unique()
+    np.random.shuffle(unique_img_paths)
+    n_val = int(len(unique_img_paths) * VAL_SPLIT_RATIO)
+    val_img_names = unique_img_paths[:n_val].tolist()
+    train_img_names = unique_img_paths[n_val:].tolist()
+    val_annotations_df = annotations_df[annotations_df['file_path'].isin(val_img_names)]
+    train_annotations_df = annotations_df[~annotations_df['file_path'].isin(val_img_names)]
 
     print(f"Total annotations: {len(annotations_df)}")
     print(f"Training annotations: {len(train_annotations_df)}")
@@ -97,9 +100,6 @@ def create_train_val_split(annotations_df):
         xmax, ymax = xmin + width, ymin + height
         box = (xmin, ymin, xmax, ymax)
         ANNOTATIONS[fname].append((class_id, box))
-
-    train_img_names = train_annotations_df['file_path'].unique().tolist()
-    val_img_names = val_annotations_df['file_path'].unique().tolist()
 
     print(f"Training images: {len(train_img_names)}")
     print(f"Validation images: {len(val_img_names)}")
@@ -543,7 +543,7 @@ def main():
     print(f'YOLO dataset at: {YOLO_DATASET_DIR}')
 
     # Visualize a sample
-    for i in range(max(5, len(train_dataset))):
+    for i in range(min(5, len(train_dataset))):
         sample = train_dataset[i]
         visualize_sample(sample, f"Augmented Training Sample {i+1}")
 
