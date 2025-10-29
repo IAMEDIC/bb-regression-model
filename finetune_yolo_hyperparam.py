@@ -45,13 +45,13 @@ NUM_EPOCHS = 2000
 
 # Hyperparameter Search Space Configuration
 HYPERPARAM_SEARCH_SPACE = {
-    'learning_rate': [1e-3, 5e-3, 1e-2],
-    'weight_decay': [1e-4, 5e-4, 1e-3],
-    'batch_size': [8, 16, 32],
-    'early_stopping_patience': list(range(100, 501, 100)),
-    'n_val_videos': list(range(5, 16)),
+    'learning_rate': [0.001, 0.002, 0.005, 0.01],
+    'weight_decay': [0.0001, 0.0005, 0.001],
+    'batch_size': [16, 32],
+    'early_stopping_patience': [200, 300, 400, 500],
+    'n_val_videos': [5, 8, 10, 12, 15],
     # Augmentation configurations (each is a preset)
-    'augmentation_preset': ['lowest', 'light', 'medium', 'heavy']
+    'augmentation_preset': ['heavy', 'extreme', 'ultra']
 }
 
 # Define augmentation presets
@@ -107,6 +107,32 @@ AUGMENTATION_PRESETS = {
         'brightness_limit': 0.2,
         'contrast_limit': 0.2,
         'gamma_limit': (85, 115),
+    },
+    'extreme': {
+        'horizontal_flip_p': 0.8,
+        'blur_p': 0.7,
+        'noise_p': 0.6,
+        'brightness_contrast_p': 0.7,
+        'gamma_p': 0.5,
+        'motion_blur_limit': 9,
+        'gaussian_blur_limit': 9,
+        'noise_std_range': (0.08, 0.12),
+        'brightness_limit': 0.25,
+        'contrast_limit': 0.25,
+        'gamma_limit': (80, 120),
+    },
+    'ultra': {
+        'horizontal_flip_p': 0.9,
+        'blur_p': 0.8,
+        'noise_p': 0.7,
+        'brightness_contrast_p': 0.8,
+        'gamma_p': 0.6,
+        'motion_blur_limit': 11,
+        'gaussian_blur_limit': 11,
+        'noise_std_range': (0.10, 0.15),
+        'brightness_limit': 0.3,
+        'contrast_limit': 0.3,
+        'gamma_limit': (75, 125),
     }
 }
 
@@ -832,7 +858,7 @@ def main():
     # Set random_sample=True for random search instead of grid search
     configs = generate_hyperparam_configs(
         HYPERPARAM_SEARCH_SPACE,
-        max_configs=100,
+        max_configs=50,
         random_sample=True  # Use random sampling
     )
 
