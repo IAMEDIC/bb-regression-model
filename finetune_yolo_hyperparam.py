@@ -1,16 +1,14 @@
 import hashlib
+import itertools
 import json
 import os
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
-from dataclasses import dataclass, asdict
-import itertools
+from typing import Dict, Any, List, Tuple, Optional
 
 import albumentations as A
 import cv2
-import matplotlib.patches as patches
-import matplotlib.pyplot as plt
 import mlflow
 import mlflow.pytorch
 import numpy as np
@@ -42,16 +40,16 @@ MLFLOW_USER = os.getenv("MLFLOW_USER")
 MODEL_NAME = f"fetal_structures_yolo_{TARGET_HEIGHT}x{TARGET_WIDTH}_finetuned_solimed_{DATASET_VERSION}"
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 NUM_EPOCHS = 2000
+NUM_EXPERIMENTS = 100
 
 # Hyperparameter Search Space Configuration
 HYPERPARAM_SEARCH_SPACE = {
     'learning_rate': [0.001, 0.002, 0.005, 0.01],
     'weight_decay': [0.0001, 0.0005, 0.001],
     'batch_size': [16, 32],
-    'early_stopping_patience': [200, 300, 400, 500],
-    'n_val_videos': [5, 8, 10, 12, 15],
+    'early_stopping_patience': [200, 300, 400, 500, 1000],
     # Augmentation configurations (each is a preset)
-    'augmentation_preset': ['heavy', 'extreme', 'ultra']
+    'augmentation_preset': ['lowest', 'light', 'medium', 'heavy', 'extreme', 'ultra']
 }
 
 # Define augmentation presets
@@ -144,7 +142,6 @@ class HyperparamConfig:
     weight_decay: float
     batch_size: int
     early_stopping_patience: int
-    n_val_videos: int
     augmentation_preset: str
 
     def to_dict(self) -> Dict[str, Any]:
@@ -177,12 +174,13 @@ class ExperimentResult:
 
 class HyperparamSearchTracker:
     """Track all experiments and best results"""
+
     def __init__(self, save_dir: Path):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.results: List[ExperimentResult] = []
-        self.best_iou_result: ExperimentResult = None
-        self.best_map50_result: ExperimentResult = None
+        self.best_iou_result: Optional[ExperimentResult] = None
+        self.best_map50_result: Optional[ExperimentResult] = None
 
     def add_result(self, result: ExperimentResult):
         self.results.append(result)
@@ -223,13 +221,13 @@ class HyperparamSearchTracker:
 
     def print_summary(self):
         """Print summary of best results"""
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("HYPERPARAMETER SEARCH SUMMARY")
-        print("="*80)
+        print("=" * 80)
         print(f"\nTotal experiments run: {len(self.results)}")
 
         if self.best_iou_result:
-            print("\n" + "-"*80)
+            print("\n" + "-" * 80)
             print("BEST VAL BOX IOU:")
             print(f"  IOU: {self.best_iou_result.val_box_iou:.4f}")
             print(f"  mAP@50: {self.best_iou_result.val_map50:.4f}")
@@ -238,19 +236,19 @@ class HyperparamSearchTracker:
             print(f"  Model Path: {self.best_iou_result.best_model_path}")
 
         if self.best_map50_result:
-            print("\n" + "-"*80)
+            print("\n" + "-" * 80)
             print("BEST VAL mAP@50:")
             print(f"  mAP@50: {self.best_map50_result.val_map50:.4f}")
             print(f"  IOU: {self.best_map50_result.val_box_iou:.4f}")
             print(f"  Config: {json.dumps(self.best_map50_result.config.to_dict(), indent=4)}")
             print(f"  MLflow Run ID: {self.best_map50_result.mlflow_run_id}")
             print(f"  Model Path: {self.best_map50_result.best_model_path}")
-        print("="*80 + "\n")
+        print("=" * 80 + "\n")
 
 
 def generate_hyperparam_configs(search_space: Dict[str, List],
-                                 max_configs: int = None,
-                                 random_sample: bool = False) -> List[HyperparamConfig]:
+                                max_configs: int = None,
+                                random_sample: bool = False) -> List[HyperparamConfig]:
     """Generate hyperparameter configurations from search space"""
 
     if random_sample and max_configs:
@@ -310,28 +308,33 @@ def load_and_preprocess_data():
     return annotations_df
 
 
-def create_train_val_split(annotations_df, n_val_videos=None):
-    """Create train/val split with optional limit on validation videos."""
+def create_train_val_test_split(annotations_df, n_val_videos=None, n_test_videos=None):
+    """Create train/val/test split. Test is same size as val by default."""
     unique_img_paths = annotations_df['file_path'].unique()
     np.random.shuffle(unique_img_paths)
 
-    # Calculate validation split
-    if n_val_videos is not None:
-        n_val = min(n_val_videos, len(unique_img_paths))
+    # Calculate splits
+    if n_test_videos is not None:
+        n_test = min(n_test_videos, len(unique_img_paths) // 3)
     else:
-        n_val = int(len(unique_img_paths) * 0.3)
+        n_test = int(len(unique_img_paths) * 0.15)
 
-    val_img_names = unique_img_paths[:n_val].tolist()
-    train_img_names = unique_img_paths[n_val:].tolist()
-    val_annotations_df = annotations_df[annotations_df['file_path'].isin(val_img_names)]
-    train_annotations_df = annotations_df[~annotations_df['file_path'].isin(val_img_names)]
+    if n_val_videos is not None:
+        n_val = min(n_val_videos, len(unique_img_paths) - n_test)
+    else:
+        n_val = n_test  # Same size as test
 
-    print(f"Total annotations: {len(annotations_df)}")
-    print(f"Training annotations: {len(train_annotations_df)}")
-    print(f"Validation annotations: {len(val_annotations_df)}")
-    print(f"Train/Val split: {len(train_annotations_df) / len(annotations_df):.2f}/{len(val_annotations_df) / len(annotations_df):.2f}")
+    # Split in order: test, val, train (so test is never touched)
+    test_img_names = unique_img_paths[:n_test].tolist()
+    val_img_names = unique_img_paths[n_test:n_test + n_val].tolist()
+    train_img_names = unique_img_paths[n_test + n_val:].tolist()
 
-    # Create annotations dict
+    print(f"Total images: {len(unique_img_paths)}")
+    print(f"Train: {len(train_img_names)}, Val: {len(val_img_names)}, Test: {len(test_img_names)}")
+    print(
+        f"Split: {len(train_img_names) / len(unique_img_paths):.1%} / {len(val_img_names) / len(unique_img_paths):.1%} / {len(test_img_names) / len(unique_img_paths):.1%}")
+
+    # Create annotations dict for all images
     ANNOTATIONS = {}
     class_to_id = {'NB': 0, 'NT': 1}
     for _, row in annotations_df.iterrows():
@@ -344,10 +347,7 @@ def create_train_val_split(annotations_df, n_val_videos=None):
         box = (xmin, ymin, xmax, ymax)
         ANNOTATIONS[fname].append((class_id, box))
 
-    print(f"Training images: {len(train_img_names)}")
-    print(f"Validation images: {len(val_img_names)}")
-
-    return train_img_names, val_img_names, ANNOTATIONS
+    return train_img_names, val_img_names, test_img_names, ANNOTATIONS
 
 
 def get_transforms(aug_params: Dict[str, Any] = None):
@@ -385,7 +385,9 @@ def get_transforms(aug_params: Dict[str, Any] = None):
 
 
 class FinetuneDetectionDataset(Dataset):
-    def __init__(self, image_root: str, img_names: list[str], annotations: dict[str, list[tuple[int, tuple[int,int,int,int]]]], transform: A.Compose | None = None):
+    def __init__(self, image_root: str, img_names: list[str],
+                 annotations: dict[str, list[tuple[int, tuple[int, int, int, int]]]],
+                 transform: A.Compose | None = None):
         self.image_root = image_root
         self.img_names = img_names
         self.annotations = annotations
@@ -515,6 +517,7 @@ class YOLODatasetPreparator:
 
 class ImageListDataset(MLFLowDataset):
     def __init__(self, names: list[str], source: str = "picture_bb_annotations.csv", version: str = DATASET_VERSION):
+        super().__init__()
         self._names = names
         self._source = source
         self._version = version
@@ -591,25 +594,23 @@ def setup_mlflow():
 
 
 def run_single_experiment(config: HyperparamConfig,
-                          annotations_df: pd.DataFrame,
+                          train_img_names: list,
+                          val_img_names: list,
+                          ANNOTATIONS: dict,
                           experiment_idx: int,
                           total_experiments: int) -> Tuple[ExperimentResult, str]:
-    """Run a single training experiment with given hyperparameter configuration"""
+    """Run a single training experiment with given hyperparameter configuration."""
 
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"EXPERIMENT {experiment_idx + 1}/{total_experiments}")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
     print(f"Configuration:")
     print(json.dumps(config.to_dict(), indent=2))
-    print(f"{'='*80}\n")
+    print(f"{'=' * 80}\n")
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-    # Create train/val split with specified n_val_videos
-    train_img_names, val_img_names, ANNOTATIONS = create_train_val_split(
-        annotations_df,
-        n_val_videos=config.n_val_videos
-    )
+    print(f"Train: {len(train_img_names)}, Val: {len(val_img_names)}")
 
     # Get transforms with augmentation parameters
     aug_params = config.get_aug_params()
@@ -630,7 +631,7 @@ def run_single_experiment(config: HyperparamConfig,
     )
 
     # Prepare YOLO dataset
-    FINETUNE_RUN_DIR = Path('runs') / 'hyperparam_search' / f'exp_{experiment_idx+1}_{timestamp}'
+    FINETUNE_RUN_DIR = Path('runs') / 'hyperparam_search' / f'{timestamp}_exp_{experiment_idx + 1}'
     YOLO_DATASET_DIR = FINETUNE_RUN_DIR / 'dataset'
     YOLO_DATASET_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -679,7 +680,7 @@ def run_single_experiment(config: HyperparamConfig,
         return obj
 
     # Log to MLflow
-    with mlflow.start_run(run_name=f"{MLFLOW_USER}_exp_{experiment_idx+1}_{timestamp}") as run:
+    with mlflow.start_run(run_name=f"{MLFLOW_USER}_exp_{experiment_idx + 1}_{timestamp}") as run:
         mlflow_run_id = run.info.run_id
 
         # Convert augmentation parameters to native types
@@ -715,7 +716,8 @@ def run_single_experiment(config: HyperparamConfig,
         if hasattr(results, 'results_dict'):
             for k, v in results.results_dict.items():
                 if isinstance(v, (int, float)):
-                    safe_k = str(k).replace('(', '_').replace(')', '').replace('[', '_').replace(']', '').replace(' ', '_')
+                    safe_k = str(k).replace('(', '_').replace(')', '').replace('[', '_').replace(']', '').replace(' ',
+                                                                                                                  '_')
                     mlflow.log_metric(f"train/{safe_k}", float(v))
 
         # Log best model
@@ -737,7 +739,9 @@ def run_single_experiment(config: HyperparamConfig,
                             continue
                         val = row[col]
                         if isinstance(val, (int, float, np.floating)) and np.isfinite(val):
-                            safe_col = str(col).replace('(', '_').replace(')', '').replace('[', '_').replace(']', '').replace(' ', '_')
+                            safe_col = str(col).replace('(', '_').replace(')', '').replace('[', '_').replace(']',
+                                                                                                             '').replace(
+                                ' ', '_')
                             if step is not None:
                                 mlflow.log_metric(f"train_epoch/{safe_col}", float(val), step=step)
                             else:
@@ -753,7 +757,8 @@ def run_single_experiment(config: HyperparamConfig,
         if hasattr(val_results, 'results_dict'):
             for k, v in val_results.results_dict.items():
                 if isinstance(v, (int, float)):
-                    safe_k = str(k).replace('(', '_').replace(')', '').replace('[', '_').replace(']', '').replace(' ', '_')
+                    safe_k = str(k).replace('(', '_').replace(')', '').replace('[', '_').replace(']', '').replace(' ',
+                                                                                                                  '_')
                     mlflow.log_metric(f"val/{safe_k}", float(v))
                     if 'map50' in str(k).lower() or 'mAP50' in str(k):
                         val_map50 = float(v)
@@ -827,11 +832,11 @@ def run_single_experiment(config: HyperparamConfig,
         val_box_iou = float(np.mean(all_ious)) if all_ious else 0.0
         mlflow.log_metric('val_box_iou_mean', val_box_iou)
 
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print(f"EXPERIMENT {experiment_idx + 1} RESULTS:")
         print(f"  Val Box IOU: {val_box_iou:.4f}")
         print(f"  Val mAP@50: {val_map50:.4f}")
-        print(f"{'='*80}\n")
+        print(f"{'=' * 80}\n")
 
         # Create result object
         result = ExperimentResult(
@@ -846,6 +851,146 @@ def run_single_experiment(config: HyperparamConfig,
         return result, mlflow_run_id
 
 
+def evaluate_best_model_on_test(best_result: ExperimentResult,
+                                test_img_names: list,
+                                ANNOTATIONS: dict,
+                                experiment_name: str) -> Dict[str, float]:
+    """Evaluate the best model on the test set - works exactly like validation."""
+
+    print(f"\n{'=' * 80}")
+    print("EVALUATING BEST MODEL ON TEST SET")
+    print(f"{'=' * 80}")
+    print(f"Best model: {best_result.best_model_path}")
+    print(f"Best val IOU: {best_result.val_box_iou:.4f}")
+    print(f"Best val mAP@50: {best_result.val_map50:.4f}")
+    print(f"{'=' * 80}\n")
+
+    if not os.path.exists(best_result.best_model_path):
+        print(f"Error: Model not found at {best_result.best_model_path}")
+        return {}
+
+    model = YOLO(best_result.best_model_path)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    # Create test dataset (no augmentation - same as val)
+    aug_params = best_result.config.get_aug_params()
+    _, test_transform = get_transforms(aug_params)
+
+    test_dataset = FinetuneDetectionDataset(
+        image_root=DATASET_IMAGES_DIR,
+        img_names=test_img_names,
+        annotations=ANNOTATIONS,
+        transform=test_transform
+    )
+
+    # Prepare test split
+    TEST_RUN_DIR = Path('runs') / 'hyperparam_search' / f'{experiment_name}_test_{timestamp}'
+    YOLO_TEST_DIR = TEST_RUN_DIR / 'dataset'
+    YOLO_TEST_DIR.mkdir(parents=True, exist_ok=True)
+
+    test_prep = YOLODatasetPreparator(test_dataset, YOLO_TEST_DIR)
+    test_prep.prepare_split('val')  # Use 'val' name for YOLO compatibility
+
+    test_config_path = create_yolo_config(YOLO_TEST_DIR, test_dataset)
+
+    # Run validation on test set
+    print("\nRunning evaluation on test set...")
+    test_results = model.val(data=str(test_config_path), split='val', verbose=True, plots=True)
+
+    # Extract metrics
+    test_metrics = {}
+    test_map50 = 0.0
+    if hasattr(test_results, 'results_dict'):
+        for k, v in test_results.results_dict.items():
+            if isinstance(v, (int, float)):
+                safe_k = str(k).replace('(', '_').replace(')', '').replace('[', '_').replace(']', '').replace(' ', '_')
+                test_metrics[f"test/{safe_k}"] = float(v)
+                if 'map50' in str(k).lower() or 'mAP50' in str(k):
+                    test_map50 = float(v)
+
+    # Custom IOU calculation (same as val)
+    print("\nCalculating custom box IOU on test set...")
+    all_ious = []
+    test_images_dir = YOLO_TEST_DIR / 'val' / 'images'
+
+    for img_file in list(test_images_dir.glob('*.jpg')):
+        label_file = test_images_dir.parent / 'labels' / (img_file.stem + '.txt')
+        gt_by_class = {}
+        if label_file.exists():
+            with open(label_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) == 5:
+                        cid = int(float(parts[0]))
+                        cx, cy, w, h = map(float, parts[1:])
+                        gt_by_class[cid] = torch.tensor([cx, cy, w, h], dtype=torch.float32)
+
+        preds = model.predict(str(img_file), conf=0.25, verbose=False)
+        pred_by_class = {}
+        if len(preds) > 0 and preds[0].boxes is not None:
+            boxes = preds[0].boxes
+            if hasattr(boxes, 'xywhn'):
+                xywhn = boxes.xywhn.cpu().numpy()
+            else:
+                img = cv2.imread(str(img_file))
+                h, w = img.shape[:2]
+                xyxy = boxes.xyxy.cpu().numpy()
+                xywhn = []
+                for x1, y1, x2, y2 in xyxy:
+                    cx = ((x1 + x2) / 2) / w
+                    cy = ((y1 + y2) / 2) / h
+                    ww = (x2 - x1) / w
+                    hh = (y2 - y1) / h
+                    xywhn.append([cx, cy, ww, hh])
+                xywhn = np.array(xywhn)
+            cls = boxes.cls.cpu().numpy().astype(int)
+            conf = boxes.conf.cpu().numpy()
+            for i, c in enumerate(cls):
+                if c not in pred_by_class or conf[i] > pred_by_class[c][1]:
+                    pred_by_class[c] = (torch.tensor(xywhn[i], dtype=torch.float32), float(conf[i]))
+
+        classes = set(list(gt_by_class.keys()) + list(pred_by_class.keys()))
+        if classes:
+            gt_mask = torch.zeros(2)
+            pred_mask = torch.zeros(2)
+            gt_boxes = torch.zeros((2, 4))
+            pred_boxes = torch.zeros((2, 4))
+            for c in classes:
+                if c in gt_by_class:
+                    gt_mask[c] = 1
+                    gt_boxes[c] = gt_by_class[c]
+                if c in pred_by_class:
+                    pred_mask[c] = 1
+                    pred_boxes[c] = pred_by_class[c][0]
+
+            ious = []
+            for c in classes:
+                if gt_mask[c] == 1 and pred_mask[c] == 1:
+                    ious.append(box_iou(gt_boxes[c], pred_boxes[c]))
+            if ious:
+                all_ious.append(float(np.mean(ious)))
+
+    test_box_iou = float(np.mean(all_ious)) if all_ious else 0.0
+    test_metrics['test_box_iou_mean'] = test_box_iou
+    test_metrics['test_map50'] = test_map50
+
+    # Log to MLflow
+    with mlflow.start_run(run_id=best_result.mlflow_run_id):
+        for k, v in test_metrics.items():
+            mlflow.log_metric(k, v)
+        mlflow.log_param('test_evaluated', True)
+        mlflow.log_param('test_images', len(test_img_names))
+
+    print(f"\n{'=' * 80}")
+    print("TEST SET RESULTS:")
+    print(f"  Test Box IOU: {test_box_iou:.4f}")
+    print(f"  Test mAP@50: {test_map50:.4f}")
+    print(f"  Test images: {len(test_img_names)}")
+    print(f"{'=' * 80}\n")
+
+    return test_metrics
+
+
 def main():
     """Main function to run hyperparameter search"""
 
@@ -853,52 +998,125 @@ def main():
     setup_mlflow()
     annotations_df = load_and_preprocess_data()
 
+    # Create fixed train/val/test split once (70%/15%/15%)
+    print(f"\n{'=' * 80}")
+    print("CREATING FIXED TRAIN/VAL/TEST SPLIT")
+    print(f"{'=' * 80}\n")
+
+    unique_img_paths = annotations_df['file_path'].unique()
+    np.random.shuffle(unique_img_paths)
+
+    total_images = len(unique_img_paths)
+    n_train = int(total_images * 0.7)
+    n_val = int(total_images * 0.15)
+    n_test = total_images - n_train - n_val
+
+    train_img_names = unique_img_paths[:n_train].tolist()
+    val_img_names = unique_img_paths[n_train:n_train + n_val].tolist()
+    test_img_names = unique_img_paths[n_train + n_val:].tolist()
+
+    # Create full annotations dict (includes all splits)
+    ANNOTATIONS = {}
+    class_to_id = {'NB': 0, 'NT': 1}
+    for _, row in annotations_df.iterrows():
+        fname = row['file_path']
+        if fname not in ANNOTATIONS:
+            ANNOTATIONS[fname] = []
+        class_id = class_to_id[row['bb_class']]
+        xmin, ymin, width, height = row['x_min'], row['y_min'], row['width'], row['height']
+        xmax, ymax = xmin + width, ymin + height
+        box = (xmin, ymin, xmax, ymax)
+        ANNOTATIONS[fname].append((class_id, box))
+
+    print(f"Total images: {total_images}")
+    print(f"Train: {len(train_img_names)} ({len(train_img_names) / total_images:.1%})")
+    print(f"Val: {len(val_img_names)} ({len(val_img_names) / total_images:.1%})")
+    print(f"Test: {len(test_img_names)} ({len(test_img_names) / total_images:.1%})")
+    print(f"{'=' * 80}\n")
+
     # Generate hyperparameter configurations
-    # You can adjust max_configs to limit the number of experiments
-    # Set random_sample=True for random search instead of grid search
     configs = generate_hyperparam_configs(
         HYPERPARAM_SEARCH_SPACE,
-        max_configs=50,
-        random_sample=True  # Use random sampling
+        max_configs=NUM_EXPERIMENTS,
+        random_sample=True
     )
 
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"HYPERPARAMETER SEARCH")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
     print(f"Total configurations to test: {len(configs)}")
-    print(f"{'='*80}\n")
+    print(f"{'=' * 80}\n")
 
     # Initialize tracker
     tracker_dir = Path('runs') / 'hyperparam_search' / datetime.now().strftime('%Y%m%d_%H%M%S')
     tracker = HyperparamSearchTracker(tracker_dir)
+    experiment_name = tracker_dir.name
 
-    # Run experiments
+    # Run experiments on train/val only (test set held out)
     for idx, config in enumerate(configs):
         try:
-            result, run_id = run_single_experiment(config, annotations_df, idx, len(configs))
+            result, run_id = run_single_experiment(
+                config,
+                train_img_names,
+                val_img_names,
+                ANNOTATIONS,
+                idx,
+                len(configs)
+            )
             tracker.add_result(result)
 
-            # Print intermediate best results
-            print(f"\n{'='*80}")
+            # Print progress
+            print(f"\n{'=' * 80}")
             print(f"PROGRESS: {idx + 1}/{len(configs)} experiments completed")
             if tracker.best_iou_result:
                 print(f"Current Best IOU: {tracker.best_iou_result.val_box_iou:.4f}")
             if tracker.best_map50_result:
                 print(f"Current Best mAP@50: {tracker.best_map50_result.val_map50:.4f}")
-            print(f"{'='*80}\n")
+            print(f"{'=' * 80}\n")
 
         except Exception as e:
-            print(f"\n{'!'*80}")
+            print(f"\n{'!' * 80}")
             print(f"ERROR in experiment {idx + 1}: {str(e)}")
-            print(f"{'!'*80}\n")
+            print(f"{'!' * 80}\n")
+            import traceback
+            traceback.print_exc()
             continue
 
-    # Print final summary
+    # Print summary
     tracker.print_summary()
 
-    print(f"\nResults saved to: {tracker.save_dir}")
+    # Evaluate best model on test set
+    if tracker.best_iou_result:
+        try:
+            test_metrics = evaluate_best_model_on_test(
+                tracker.best_iou_result,
+                test_img_names,
+                ANNOTATIONS,
+                experiment_name
+            )
+
+            # Save test results
+            test_results_path = tracker.save_dir / 'test_set_results.json'
+            with open(test_results_path, 'w') as f:
+                json.dump({
+                    'test_metrics': test_metrics,
+                    'best_config': tracker.best_iou_result.config.to_dict(),
+                    'val_box_iou': tracker.best_iou_result.val_box_iou,
+                    'val_map50': tracker.best_iou_result.val_map50,
+                    'test_images': len(test_img_names)
+                }, f, indent=2)
+
+            print(f"\n✅ Test results saved to: {test_results_path}")
+
+        except Exception as e:
+            print(f"\n❌ Error evaluating on test set: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    print(f"\nAll results saved to: {tracker.save_dir}")
     print(f"  - {tracker.save_dir / 'hyperparam_search_results.json'}")
     print(f"  - {tracker.save_dir / 'hyperparam_search_summary.csv'}")
+    print(f"  - {tracker.save_dir / 'test_set_results.json'}")
 
 
 if __name__ == "__main__":
